@@ -1,0 +1,382 @@
+name: Build Subtitle Auto Find
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Android project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/subtitle/autofind
+          mkdir -p app/src/main/res/layout app/src/main/res/xml app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = 'SubtitleAutoFind'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.subtitle.autofind'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.subtitle.autofind'
+                  minSdk 24
+                  targetSdk 28
+                  versionCode 1
+                  versionName '0.1-test'
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Subtitle Auto Find</string>
+              <string name="accessibility_desc">Automates title entry/search in the existing Subtitle Player after you press AUTO FIND.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="24dp"
+              android:gravity="center_horizontal">
+
+              <TextView
+                  android:id="@+id/status"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="Ready. Keep the TV channel playing, then press AUTO FIND."
+                  android:textSize="18sp"
+                  android:paddingBottom="24dp" />
+
+              <Button
+                  android:id="@+id/autoFind"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="AUTO FIND" />
+
+              <Button
+                  android:id="@+id/accessibility"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:text="Enable automation service" />
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/accessibility_desc"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewFocused"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="100"
+              android:canRetrieveWindowContent="true"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows" />
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Subtitle Auto Find"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AutoAccessibilityService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/subtitle/autofind/MainActivity.java <<'EOF'
+          package com.subtitle.autofind;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.widget.Button;
+          import android.widget.TextView;
+          import java.io.BufferedReader;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLEncoder;
+          import java.util.Locale;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+              private TextView status;
+
+              @Override public void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  setContentView(R.layout.activity_main);
+                  status = findViewById(R.id.status);
+                  Button auto = findViewById(R.id.autoFind);
+                  Button access = findViewById(R.id.accessibility);
+                  access.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+                  auto.setOnClickListener(v -> autoFind());
+              }
+
+              private void autoFind() {
+                  status.setText("Reading DTV / EPG…");
+                  new Thread(() -> {
+                      try {
+                          String current = get("http://127.0.0.1:9000/request?cmd=channel_current");
+                          String epg = get("http://127.0.0.1:9000/request?cmd=epg");
+                          String title = extractTitle(epg);
+
+                          // Some firmware requires current-channel identifiers on the EPG request.
+                          if (title == null) {
+                              String serviceId = pick(current, "service_id", "serviceId", "serviceid");
+                              String streamId  = pick(current, "stream_id", "streamId", "streamid");
+                              String networkId = pick(current, "network_id", "networkId", "networkid");
+                              String freq      = pick(current, "freq", "frequency");
+                              String position  = pick(current, "position", "sat_position");
+                              StringBuilder u = new StringBuilder("http://127.0.0.1:9000/request?cmd=epg");
+                              if (serviceId != null) u.append("&service_id=").append(enc(serviceId));
+                              if (streamId  != null) u.append("&stream_id=").append(enc(streamId));
+                              if (networkId != null) u.append("&network_id=").append(enc(networkId));
+                              if (freq      != null) u.append("&freq=").append(enc(freq));
+                              if (position  != null) u.append("&position=").append(enc(position));
+                              epg = get(u.toString());
+                              title = extractTitle(epg);
+                          }
+
+                          if (title == null || title.trim().isEmpty()) {
+                              fail("No current EPG title was returned on this channel. Use the original manual search for now.");
+                              return;
+                          }
+
+                          title = cleanTitle(title);
+                          long elapsedMs = extractElapsed(epg);
+                          getSharedPreferences("auto", MODE_PRIVATE).edit()
+                              .putString("pending_title", title)
+                              .putLong("elapsed_ms", elapsedMs)
+                              .putLong("created_at", System.currentTimeMillis())
+                              .apply();
+
+                          ClipboardManager cb = (ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+                          cb.setPrimaryClip(ClipData.newPlainText("Detected title", title));
+
+                          final String detected = title;
+                          runOnUiThread(() -> status.setText("Detected: " + detected + "\nOpening Subtitle Player…"));
+                          Intent launch = getPackageManager().getLaunchIntentForPackage("com.waellotfy.subtitleplayer");
+                          if (launch == null) {
+                              fail("Detected: " + detected + "\nSubtitle Player package was not found.");
+                              return;
+                          }
+                          launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          startActivity(launch);
+                      } catch (Exception e) {
+                          fail("AUTO FIND error: " + e.getMessage());
+                      }
+                  }).start();
+              }
+
+              private void fail(String s) { runOnUiThread(() -> status.setText(s)); }
+
+              private static String get(String url) throws Exception {
+                  HttpURLConnection c = (HttpURLConnection)new URL(url).openConnection();
+                  c.setConnectTimeout(2500); c.setReadTimeout(4000); c.setRequestMethod("GET");
+                  BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
+                  StringBuilder out = new StringBuilder(); String line;
+                  while ((line = br.readLine()) != null) out.append(line).append('\n');
+                  br.close(); c.disconnect(); return out.toString();
+              }
+
+              private static String enc(String s) throws Exception { return URLEncoder.encode(s, "UTF-8"); }
+
+              private static String pick(String s, String... keys) {
+                  if (s == null) return null;
+                  for (String k : keys) {
+                      String q = Pattern.quote(k);
+                      Pattern[] ps = new Pattern[] {
+                          Pattern.compile("(?is)<"+q+">\\s*([^<]+?)\\s*</"+q+">") ,
+                          Pattern.compile("(?is)\\b"+q+"\\s*=\\s*[\"']?([^\"'&<>\\s]+)"),
+                          Pattern.compile("(?is)[\"']"+q+"[\"']\\s*:\\s*[\"']?([^\"',}]+)")
+                      };
+                      for (Pattern p : ps) { Matcher m=p.matcher(s); if (m.find()) return m.group(1).trim(); }
+                  }
+                  return null;
+              }
+
+              private static String extractTitle(String s) {
+                  if (s == null) return null;
+                  String[] keys = {"epgName","programName","programmeName","event_name","eventName","title","name"};
+                  for (String k : keys) {
+                      String v = pick(s,k);
+                      if (v != null && v.length() > 1 && !v.matches("(?i)(epg|event|channel|current)")) return html(v);
+                  }
+                  return null;
+              }
+
+              private static String cleanTitle(String s) {
+                  s = html(s).replaceAll("(?i)\\b(HD|FHD|UHD|4K)\\b", " ");
+                  s = s.replaceAll("\\s+", " ").trim();
+                  return s;
+              }
+
+              private static long extractElapsed(String epg) {
+                  try {
+                      String st = pick(epg,"startTime","start_time","starttime","epg_starttime");
+                      if (st == null) return -1;
+                      long n = Long.parseLong(st.replaceAll("[^0-9]",""));
+                      if (n < 100000000000L) n *= 1000L;
+                      long d = System.currentTimeMillis() - n;
+                      return d >= 0 && d < 8L*60*60*1000 ? d : -1;
+                  } catch(Exception e) { return -1; }
+              }
+
+              private static String html(String s) {
+                  return s.replace("&amp;","&").replace("&quot;","\\\"")
+                          .replace("&#39;","'").replace("&lt;","<").replace("&gt;",">").trim();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/subtitle/autofind/AutoAccessibilityService.java <<'EOF'
+          package com.subtitle.autofind;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import java.util.ArrayDeque;
+          import java.util.Locale;
+
+          public class AutoAccessibilityService extends AccessibilityService {
+              private final Handler h = new Handler();
+              private long lastRun = 0;
+
+              @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (event.getPackageName()==null || !"com.waellotfy.subtitleplayer".contentEquals(event.getPackageName())) return;
+                  long now=System.currentTimeMillis(); if(now-lastRun<700) return; lastRun=now;
+                  String title=getSharedPreferences("auto",MODE_PRIVATE).getString("pending_title",null);
+                  long created=getSharedPreferences("auto",MODE_PRIVATE).getLong("created_at",0);
+                  if(title==null || now-created>120000) return;
+                  h.postDelayed(() -> automate(title), 350);
+              }
+
+              private void automate(String title) {
+                  AccessibilityNodeInfo root=getRootInActiveWindow(); if(root==null) return;
+                  AccessibilityNodeInfo edit=findEditable(root);
+                  if(edit!=null) {
+                      Bundle b=new Bundle(); b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,title);
+                      edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,b);
+                      AccessibilityNodeInfo search=findText(root,"search","بحث");
+                      if(search!=null) click(search);
+                      // Keep the original manual Sync/seek/play controls untouched.
+                      // Position correction is only attempted when an explicitly editable time/position field is exposed.
+                      h.postDelayed(this::attemptPosition, 2200);
+                      getSharedPreferences("auto",MODE_PRIVATE).edit().remove("pending_title").apply();
+                  }
+              }
+
+              private void attemptPosition() {
+                  long ms=getSharedPreferences("auto",MODE_PRIVATE).getLong("elapsed_ms",-1);
+                  if(ms<0) return;
+                  AccessibilityNodeInfo root=getRootInActiveWindow(); if(root==null) return;
+                  AccessibilityNodeInfo n=findEditableByHint(root,"position","time","sync","موضع","وقت");
+                  if(n==null) return;
+                  long sec=ms/1000; String value=String.format(Locale.US,"%02d:%02d:%02d",sec/3600,(sec/60)%60,sec%60);
+                  Bundle b=new Bundle(); b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,value);
+                  n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT,b);
+              }
+
+              private AccessibilityNodeInfo findEditable(AccessibilityNodeInfo root) {
+                  ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
+                  while(!q.isEmpty()) { AccessibilityNodeInfo n=q.remove(); if(n.isEditable()) return n; for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);} }
+                  return null;
+              }
+              private AccessibilityNodeInfo findEditableByHint(AccessibilityNodeInfo root,String... words) {
+                  ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
+                  while(!q.isEmpty()) { AccessibilityNodeInfo n=q.remove();
+                      if(n.isEditable()) { String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT); for(String w:words) if(z.contains(w)) return n; }
+                      for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);} }
+                  return null;
+              }
+              private AccessibilityNodeInfo findText(AccessibilityNodeInfo root,String... words) {
+                  ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
+                  while(!q.isEmpty()) { AccessibilityNodeInfo n=q.remove(); String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT); for(String w:words) if(z.contains(w)) return n; for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);} }
+                  return null;
+              }
+              private void click(AccessibilityNodeInfo n) { AccessibilityNodeInfo x=n; while(x!=null){ if(x.isClickable()){x.performAction(AccessibilityNodeInfo.ACTION_CLICK);return;} x=x.getParent(); } }
+              @Override public void onInterrupt() {}
+          }
+          EOF
+
+      - name: Install Gradle
+        shell: bash
+        run: |
+          curl -L --retry 3 -o gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q gradle.zip
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-test.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SubtitleAutoFind-test-apk
+          path: SubtitleAutoFind-test.apk
+          if-no-files-found: error
