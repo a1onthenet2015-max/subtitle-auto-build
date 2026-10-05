@@ -62,8 +62,8 @@ jobs:
                   applicationId 'com.subtitle.autofind'
                   minSdk 24
                   targetSdk 28
-                  versionCode 2
-                  versionName '0.2-epg-fallback'
+                  versionCode 3
+                  versionName '0.3-search-flow'
               }
           }
           EOF
@@ -88,7 +88,7 @@ jobs:
                   android:id="@+id/status"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:text="Ready. If DTV has no direct EPG, the app will also try the last program title seen on the DTV screen."
+                  android:text="Ready. AUTO FIND will detect the title, resolve localized names, open the original Subtitle Player Search, and start the search."
                   android:textSize="18sp"
                   android:paddingBottom="24dp" />
 
@@ -153,14 +153,16 @@ jobs:
 
           cat > app/src/main/java/com/subtitle/autofind/MainActivity.java <<'EOF'
           package com.subtitle.autofind;
-
+          
           import android.app.Activity;
           import android.content.ClipData;
           import android.content.ClipboardManager;
+          import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
           import android.os.Bundle;
           import android.provider.Settings;
+          import android.text.TextUtils;
           import android.widget.Button;
           import android.widget.TextView;
           import java.io.BufferedReader;
@@ -171,10 +173,12 @@ jobs:
           import java.util.Locale;
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
-
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
           public class MainActivity extends Activity {
               private TextView status;
-
+          
               @Override public void onCreate(Bundle b) {
                   super.onCreate(b);
                   setContentView(R.layout.activity_main);
@@ -184,16 +188,38 @@ jobs:
                   access.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
                   auto.setOnClickListener(v -> autoFind());
               }
-
+          
+              @Override protected void onResume() {
+                  super.onResume();
+                  if (status != null && !isAccessibilityEnabled()) {
+                      status.setText("Automation service is OFF. Press ENABLE AUTOMATION SERVICE and enable Subtitle Auto Find first.");
+                  }
+              }
+          
+              private boolean isAccessibilityEnabled() {
+                  try {
+                      String enabled = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                      if (enabled == null) return false;
+                      String me = new ComponentName(this, AutoAccessibilityService.class).flattenToString();
+                      TextUtils.SimpleStringSplitter splitter = new TextUtils.SimpleStringSplitter(':');
+                      splitter.setString(enabled);
+                      while (splitter.hasNext()) if (me.equalsIgnoreCase(splitter.next())) return true;
+                  } catch (Throwable ignored) {}
+                  return false;
+              }
+          
               private void autoFind() {
+                  if (!isAccessibilityEnabled()) {
+                      status.setText("Automation service is OFF. Enable it first, then press AUTO FIND again.");
+                      return;
+                  }
                   status.setText("Reading DTV / EPG…");
                   new Thread(() -> {
                       try {
                           String current = get("http://127.0.0.1:9000/request?cmd=channel_current");
                           String epg = get("http://127.0.0.1:9000/request?cmd=epg");
                           String title = extractTitle(epg);
-
-                          // Some firmware requires current-channel identifiers on the EPG request.
+          
                           if (title == null) {
                               String serviceId = pick(current, "service_id", "serviceId", "serviceid");
                               String streamId  = pick(current, "stream_id", "streamId", "streamid");
@@ -209,10 +235,9 @@ jobs:
                               epg = get(u.toString());
                               title = extractTitle(epg);
                           }
-
+          
                           long elapsedMs = extractElapsed(epg);
-
-                          // Fallback 2: title cached by Accessibility while DTV was visible.
+          
                           if (title == null || title.trim().isEmpty()) {
                               long seen = getSharedPreferences("auto", MODE_PRIVATE).getLong("last_dtv_seen", 0);
                               String cached = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_title", null);
@@ -221,30 +246,44 @@ jobs:
                                   elapsedMs = -1;
                               }
                           }
-
+          
                           if (title == null || title.trim().isEmpty()) {
                               String channel = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_channel", "");
                               String extra = channel.isEmpty() ? "" : ("\nChannel: " + channel);
                               fail("No title was found from DVB/EPG or the DTV screen." + extra +
-                                   "\nOn this channel, press INFO once so the DTV banner is visible, then press AUTO FIND again. If the banner itself has no program name, this channel needs an online-schedule fallback.");
+                                   "\nPress INFO on DTV once, then AUTO FIND again.");
                               return;
                           }
-
-                          title = cleanTitle(title);
+          
+                          String rawTitle = cleanTitle(title);
+                          final String rawForUi = rawTitle;
+                          runOnUiThread(() -> status.setText("Detected: " + rawForUi + "\nResolving original title…"));
+          
+                          String resolved = resolveOriginalTitle(rawTitle);
+                          String searchTitle = (resolved == null || resolved.trim().isEmpty()) ? rawTitle : resolved.trim();
+          
                           getSharedPreferences("auto", MODE_PRIVATE).edit()
-                              .putString("pending_title", title)
+                              .putString("pending_title", searchTitle)
+                              .putString("detected_title", rawTitle)
                               .putLong("elapsed_ms", elapsedMs)
                               .putLong("created_at", System.currentTimeMillis())
+                              .putString("automation_state", "opening")
                               .apply();
-
+          
                           ClipboardManager cb = (ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
-                          cb.setPrimaryClip(ClipData.newPlainText("Detected title", title));
-
-                          final String detected = title;
-                          runOnUiThread(() -> status.setText("Detected: " + detected + "\nOpening Subtitle Player…"));
+                          cb.setPrimaryClip(ClipData.newPlainText("Detected title", searchTitle));
+          
+                          final String detected = rawTitle;
+                          final String toSearch = searchTitle;
+                          runOnUiThread(() -> status.setText(
+                              detected.equalsIgnoreCase(toSearch)
+                                  ? ("Detected: " + detected + "\nOpening Subtitle Player and starting Search…")
+                                  : ("Detected: " + detected + "\nOriginal title: " + toSearch + "\nOpening Subtitle Player and starting Search…")
+                          ));
+          
                           Intent launch = getPackageManager().getLaunchIntentForPackage("com.waellotfy.subtitleplayer");
                           if (launch == null) {
-                              fail("Detected: " + detected + "\nSubtitle Player package was not found.");
+                              fail("Subtitle Player package was not found.");
                               return;
                           }
                           launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -254,20 +293,23 @@ jobs:
                       }
                   }).start();
               }
-
+          
               private void fail(String s) { runOnUiThread(() -> status.setText(s)); }
-
+          
               private static String get(String url) throws Exception {
                   HttpURLConnection c = (HttpURLConnection)new URL(url).openConnection();
-                  c.setConnectTimeout(2500); c.setReadTimeout(4000); c.setRequestMethod("GET");
+                  c.setConnectTimeout(3500);
+                  c.setReadTimeout(5000);
+                  c.setRequestMethod("GET");
+                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/0.3 Android");
                   BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
                   StringBuilder out = new StringBuilder(); String line;
                   while ((line = br.readLine()) != null) out.append(line).append('\n');
                   br.close(); c.disconnect(); return out.toString();
               }
-
+          
               private static String enc(String s) throws Exception { return URLEncoder.encode(s, "UTF-8"); }
-
+          
               private static String pick(String s, String... keys) {
                   if (s == null) return null;
                   for (String k : keys) {
@@ -281,7 +323,7 @@ jobs:
                   }
                   return null;
               }
-
+          
               private static String extractTitle(String s) {
                   if (s == null) return null;
                   String[] keys = {"epgName","programName","programmeName","event_name","eventName","title","name"};
@@ -291,13 +333,56 @@ jobs:
                   }
                   return null;
               }
-
+          
               private static String cleanTitle(String s) {
                   s = html(s).replaceAll("(?i)\\b(HD|FHD|UHD|4K)\\b", " ");
-                  s = s.replaceAll("\\s+", " ").trim();
-                  return s;
+                  s = s.replaceAll("(?i)\\s*[\\(\\[]?(19|20)\\d{2}[\\)\\]]?\\s*$", " ");
+                  return s.replaceAll("\\s+", " ").trim();
               }
-
+          
+              // Converts localized EPG titles (for example Incepcja) to the original/English
+              // title (Inception) using Wikidata. If resolution fails, the EPG title is kept.
+              private static String resolveOriginalTitle(String title) {
+                  String[] langs = {"en","pl","fr","de","es","it","pt","ro","cs","sk","hu","tr","uk","ru","ar"};
+                  try {
+                      for (String lang : langs) {
+                          String u = "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&limit=6&type=item&language="
+                                  + lang + "&search=" + enc(title);
+                          JSONObject obj = new JSONObject(get(u));
+                          JSONArray arr = obj.optJSONArray("search");
+                          if (arr == null || arr.length() == 0) continue;
+                          String candidateId = null;
+                          for (int i=0;i<arr.length();i++) {
+                              JSONObject x = arr.optJSONObject(i);
+                              if (x == null) continue;
+                              String desc = x.optString("description", "").toLowerCase(Locale.ROOT);
+                              if (desc.contains("film") || desc.contains("movie") || desc.contains("television") ||
+                                  desc.contains("series") || desc.contains("serial") || desc.contains("película") ||
+                                  desc.contains("filme") || desc.contains("фильм") || desc.contains("фільм") ||
+                                  desc.contains("فيلم") || desc.contains("مسلسل")) {
+                                  candidateId = x.optString("id", null); break;
+                              }
+                          }
+                          if (candidateId == null) candidateId = arr.optJSONObject(0).optString("id", null);
+                          if (candidateId == null || !candidateId.startsWith("Q")) continue;
+          
+                          String e = "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&props=labels&languages=en&ids=" + enc(candidateId);
+                          JSONObject ent = new JSONObject(get(e)).optJSONObject("entities");
+                          if (ent == null) continue;
+                          JSONObject item = ent.optJSONObject(candidateId);
+                          if (item == null) continue;
+                          JSONObject labels = item.optJSONObject("labels");
+                          if (labels == null) continue;
+                          JSONObject en = labels.optJSONObject("en");
+                          if (en != null) {
+                              String v = en.optString("value", "").trim();
+                              if (!v.isEmpty() && v.length() < 150) return v;
+                          }
+                      }
+                  } catch (Throwable ignored) {}
+                  return title;
+              }
+          
               private static long extractElapsed(String epg) {
                   try {
                       String st = pick(epg,"startTime","start_time","starttime","epg_starttime");
@@ -308,7 +393,7 @@ jobs:
                       return d >= 0 && d < 8L*60*60*1000 ? d : -1;
                   } catch(Exception e) { return -1; }
               }
-
+          
               private static String html(String s) {
                   return s.replace("&amp;","&").replace("&quot;","\\\"")
                           .replace("&#39;","'").replace("&lt;","<").replace("&gt;",">").trim();
@@ -318,62 +403,255 @@ jobs:
 
           cat > app/src/main/java/com/subtitle/autofind/AutoAccessibilityService.java <<'EOF'
           package com.subtitle.autofind;
-
+          
           import android.accessibilityservice.AccessibilityService;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
           import android.os.Bundle;
           import android.os.Handler;
           import android.view.accessibility.AccessibilityEvent;
           import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+          import android.widget.Toast;
           import java.util.ArrayDeque;
+          import java.util.ArrayList;
           import java.util.List;
           import java.util.Locale;
-
+          
           public class AutoAccessibilityService extends AccessibilityService {
               private final Handler h = new Handler();
-              private long lastRun = 0;
+              private long lastDrive = 0;
               private static final String DTV = "com.tiartoptv.dvb";
               private static final String SUB = "com.waellotfy.subtitleplayer";
-
+          
               @Override public void onAccessibilityEvent(AccessibilityEvent event) {
                   if (event.getPackageName() == null) return;
                   String pkg = event.getPackageName().toString();
-
-                  // Cache current DTV program/channel text whenever DTV updates.
-                  if (DTV.equals(pkg)) {
-                      h.postDelayed(this::cacheDtvInfo, 120);
+          
+                  if (DTV.equals(pkg)) h.postDelayed(this::cacheDtvInfo, 120);
+          
+                  String title = pendingTitle();
+                  if (title == null) return;
+                  long now = System.currentTimeMillis();
+                  if (now - lastDrive < 350) return;
+                  lastDrive = now;
+                  h.postDelayed(() -> drive(title, 0), 250);
+              }
+          
+              private String pendingTitle() {
+                  long created = getSharedPreferences("auto", MODE_PRIVATE).getLong("created_at", 0);
+                  String title = getSharedPreferences("auto", MODE_PRIVATE).getString("pending_title", null);
+                  if (title == null || System.currentTimeMillis() - created > 180000) return null;
+                  return title;
+              }
+          
+              private void drive(String title, int attempt) {
+                  if (title == null || attempt > 8) {
+                      if (attempt > 8) toast("Search screen was not exposed to Accessibility. Manual Search still works.");
                       return;
                   }
-
-                  if (!SUB.equals(pkg)) return;
-                  long now = System.currentTimeMillis();
-                  if (now - lastRun < 700) return;
-                  lastRun = now;
-                  String title = getSharedPreferences("auto", MODE_PRIVATE).getString("pending_title", null);
-                  long created = getSharedPreferences("auto", MODE_PRIVATE).getLong("created_at", 0);
-                  if (title == null || now - created > 120000) return;
-                  h.postDelayed(() -> automate(title), 350);
+          
+                  AccessibilityNodeInfo edit = findEditableAllWindows();
+                  if (edit != null) {
+                      fillAndSearch(title, edit);
+                      return;
+                  }
+          
+                  // Subtitle Player normally starts as the small floating 'Sub' bubble.
+                  AccessibilityNodeInfo bubble = findExactAllWindows("Sub");
+                  if (bubble != null) {
+                      toast("Opening subtitle controls…");
+                      click(bubble);
+                      h.postDelayed(() -> drive(title, attempt + 1), 650);
+                      return;
+                  }
+          
+                  // Open the original Search screen before looking for its text field.
+                  AccessibilityNodeInfo search = findTextAllWindows("search subtitle", "search", "بحث", "online");
+                  if (search != null) {
+                      toast("Opening Search…");
+                      click(search);
+                      h.postDelayed(() -> drive(title, attempt + 1), 650);
+                      return;
+                  }
+          
+                  h.postDelayed(() -> drive(title, attempt + 1), 550);
               }
-
+          
+              private void fillAndSearch(String title, AccessibilityNodeInfo edit) {
+                  toast("Searching: " + title);
+                  ClipboardManager cb = (ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+                  cb.setPrimaryClip(ClipData.newPlainText("movie title", title));
+          
+                  edit.performAction(AccessibilityNodeInfo.ACTION_FOCUS);
+                  Bundle b = new Bundle();
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, title);
+                  boolean set = edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+                  if (!set) edit.performAction(AccessibilityNodeInfo.ACTION_PASTE);
+          
+                  getSharedPreferences("auto", MODE_PRIVATE).edit().putString("automation_state", "typed").apply();
+                  h.postDelayed(() -> {
+                      AccessibilityNodeInfo go = findTextAllWindows("search archive subtitle", "search", "find", "go", "بحث");
+                      if (go != null) {
+                          click(go);
+                          getSharedPreferences("auto", MODE_PRIVATE).edit().putString("automation_state", "searching").apply();
+                          h.postDelayed(this::selectFirstSubtitleResult, 2200);
+                      } else {
+                          toast("Title entered. Press Search once if it did not start automatically.");
+                      }
+                  }, 450);
+              }
+          
+              private void selectFirstSubtitleResult() {
+                  AccessibilityNodeInfo result = findSubtitleResultAllWindows();
+                  if (result != null) {
+                      toast("Subtitle found — loading…");
+                      click(result);
+                      getSharedPreferences("auto", MODE_PRIVATE).edit().putString("automation_state", "result_clicked").apply();
+                      h.postDelayed(this::clickLoadIfPresent, 900);
+                      h.postDelayed(this::attemptPosition, 1700);
+                  } else {
+                      toast("Search finished. If several results are shown, choose one; AUTO FIND will be improved from this screen.");
+                  }
+              }
+          
+              private void clickLoadIfPresent() {
+                  AccessibilityNodeInfo n = findTextAllWindows("download", "load", "open", "use subtitle", "play", "تحميل", "فتح");
+                  if (n != null) click(n);
+              }
+          
+              private AccessibilityNodeInfo findSubtitleResultAllWindows() {
+                  for (AccessibilityNodeInfo root : roots()) {
+                      ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
+                      while (!q.isEmpty()) {
+                          AccessibilityNodeInfo n = q.remove();
+                          String text = nodeText(n);
+                          if (text != null) {
+                              String z = text.toLowerCase(Locale.ROOT);
+                              if ((z.contains(".srt") || z.contains("subtitle")) &&
+                                  !z.equals("subtitle") && !z.contains("search subtitle")) {
+                                  if (n.isClickable() || clickableParent(n) != null) return n;
+                              }
+                          }
+                          for (int i=0;i<n.getChildCount();i++) { AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c); }
+                      }
+                  }
+                  return null;
+              }
+          
+              private void attemptPosition() {
+                  long ms = getSharedPreferences("auto", MODE_PRIVATE).getLong("elapsed_ms", -1);
+                  if (ms < 0) return;
+                  AccessibilityNodeInfo n = findEditableByHintAllWindows("position", "time", "sync", "موضع", "وقت");
+                  if (n == null) return;
+                  long sec = ms / 1000;
+                  String value = String.format(Locale.US, "%02d:%02d:%02d", sec/3600, (sec/60)%60, sec%60);
+                  Bundle b = new Bundle();
+                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
+                  n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
+              }
+          
+              private List<AccessibilityNodeInfo> roots() {
+                  ArrayList<AccessibilityNodeInfo> out = new ArrayList<>();
+                  try {
+                      List<AccessibilityWindowInfo> ws = getWindows();
+                      if (ws != null) for (AccessibilityWindowInfo w : ws) {
+                          AccessibilityNodeInfo r = w.getRoot(); if (r != null) out.add(r);
+                      }
+                  } catch (Throwable ignored) {}
+                  AccessibilityNodeInfo active = getRootInActiveWindow();
+                  if (active != null && !out.contains(active)) out.add(active);
+                  return out;
+              }
+          
+              private AccessibilityNodeInfo findEditableAllWindows() {
+                  for (AccessibilityNodeInfo root : roots()) {
+                      ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
+                      while (!q.isEmpty()) {
+                          AccessibilityNodeInfo n = q.remove();
+                          if (n.isEditable()) return n;
+                          for (int i=0;i<n.getChildCount();i++) { AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c); }
+                      }
+                  }
+                  return null;
+              }
+          
+              private AccessibilityNodeInfo findEditableByHintAllWindows(String... words) {
+                  for (AccessibilityNodeInfo root : roots()) {
+                      ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
+                      while(!q.isEmpty()) {
+                          AccessibilityNodeInfo n=q.remove();
+                          if(n.isEditable()) {
+                              String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT);
+                              for(String w:words) if(z.contains(w)) return n;
+                          }
+                          for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);}
+                      }
+                  }
+                  return null;
+              }
+          
+              private AccessibilityNodeInfo findExactAllWindows(String exact) {
+                  for (AccessibilityNodeInfo root : roots()) {
+                      ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
+                      while (!q.isEmpty()) {
+                          AccessibilityNodeInfo n=q.remove();
+                          String z=nodeText(n);
+                          if (z != null && exact.equalsIgnoreCase(z.trim())) return n;
+                          for (int i=0;i<n.getChildCount();i++) { AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c); }
+                      }
+                  }
+                  return null;
+              }
+          
+              private AccessibilityNodeInfo findTextAllWindows(String... words) {
+                  for (AccessibilityNodeInfo root : roots()) {
+                      ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
+                      while(!q.isEmpty()) {
+                          AccessibilityNodeInfo n=q.remove();
+                          String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT);
+                          for(String w:words) if(z.contains(w.toLowerCase(Locale.ROOT))) return n;
+                          for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);}
+                      }
+                  }
+                  return null;
+              }
+          
+              private AccessibilityNodeInfo clickableParent(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo x=n;
+                  for(int i=0;i<6 && x!=null;i++) { if(x.isClickable()) return x; x=x.getParent(); }
+                  return null;
+              }
+          
+              private void click(AccessibilityNodeInfo n) {
+                  AccessibilityNodeInfo x=clickableParent(n);
+                  if (x != null) x.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                  else n.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+              }
+          
+              private void toast(String s) { h.post(() -> Toast.makeText(this, s, Toast.LENGTH_SHORT).show()); }
+          
               private void cacheDtvInfo() {
                   AccessibilityNodeInfo root = getRootInActiveWindow();
                   if (root == null || root.getPackageName() == null || !DTV.contentEquals(root.getPackageName())) return;
-
+          
                   String title = textById(root, DTV + ":id/barEpgInfoNowTextView");
                   if (empty(title)) title = textById(root, DTV + ":id/barEpgInfoNowText");
                   if (empty(title)) title = findByIdWords(root, true, "epg", "now");
                   if (empty(title)) title = findByIdWords(root, true, "program", "name");
                   if (empty(title)) title = findByIdWords(root, true, "event", "name");
-
+          
                   String channel = findByIdWords(root, false, "channel", "name");
                   if (empty(channel)) channel = findByIdWords(root, false, "service", "name");
-
+          
                   android.content.SharedPreferences.Editor e = getSharedPreferences("auto", MODE_PRIVATE).edit();
                   if (!empty(title)) e.putString("last_dtv_title", clean(title));
                   if (!empty(channel)) e.putString("last_dtv_channel", clean(channel));
                   if (!empty(title) || !empty(channel)) e.putLong("last_dtv_seen", System.currentTimeMillis());
                   e.apply();
               }
-
+          
               private String textById(AccessibilityNodeInfo root, String id) {
                   try {
                       List<AccessibilityNodeInfo> list = root.findAccessibilityNodeInfosByViewId(id);
@@ -383,7 +661,7 @@ jobs:
                   } catch (Throwable ignored) {}
                   return null;
               }
-
+          
               private String findByIdWords(AccessibilityNodeInfo root, boolean preferLong, String... words) {
                   ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
                   String best = null;
@@ -403,7 +681,7 @@ jobs:
                   }
                   return best;
               }
-
+          
               private static String nodeText(AccessibilityNodeInfo n) {
                   if (n == null) return null;
                   CharSequence t = n.getText();
@@ -412,77 +690,10 @@ jobs:
                   if (d != null && d.toString().trim().length() > 0) return d.toString().trim();
                   return null;
               }
-
+          
               private static boolean empty(String s) { return s == null || s.trim().isEmpty(); }
               private static String clean(String s) { return s == null ? null : s.replaceAll("\\s+", " ").trim(); }
-
-              private void automate(String title) {
-                  AccessibilityNodeInfo root = getRootInActiveWindow(); if (root == null) return;
-                  AccessibilityNodeInfo edit = findEditable(root);
-                  if (edit != null) {
-                      Bundle b = new Bundle();
-                      b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, title);
-                      edit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
-                      AccessibilityNodeInfo search = findText(root, "search", "بحث");
-                      if (search != null) click(search);
-                      // Original manual Sync / seek / Play-Pause controls are not changed.
-                      // Auto-position is attempted only if the original app exposes an editable time/position field.
-                      h.postDelayed(this::attemptPosition, 2200);
-                      getSharedPreferences("auto", MODE_PRIVATE).edit().remove("pending_title").apply();
-                  }
-              }
-
-              private void attemptPosition() {
-                  long ms = getSharedPreferences("auto", MODE_PRIVATE).getLong("elapsed_ms", -1);
-                  if (ms < 0) return;
-                  AccessibilityNodeInfo root = getRootInActiveWindow(); if (root == null) return;
-                  AccessibilityNodeInfo n = findEditableByHint(root, "position", "time", "sync", "موضع", "وقت");
-                  if (n == null) return;
-                  long sec = ms / 1000;
-                  String value = String.format(Locale.US, "%02d:%02d:%02d", sec/3600, (sec/60)%60, sec%60);
-                  Bundle b = new Bundle();
-                  b.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value);
-                  n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, b);
-              }
-
-              private AccessibilityNodeInfo findEditable(AccessibilityNodeInfo root) {
-                  ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
-                  while (!q.isEmpty()) {
-                      AccessibilityNodeInfo n=q.remove(); if (n.isEditable()) return n;
-                      for (int i=0;i<n.getChildCount();i++) { AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c); }
-                  }
-                  return null;
-              }
-
-              private AccessibilityNodeInfo findEditableByHint(AccessibilityNodeInfo root, String... words) {
-                  ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
-                  while(!q.isEmpty()) {
-                      AccessibilityNodeInfo n=q.remove();
-                      if(n.isEditable()) {
-                          String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT);
-                          for(String w:words) if(z.contains(w)) return n;
-                      }
-                      for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);}
-                  }
-                  return null;
-              }
-
-              private AccessibilityNodeInfo findText(AccessibilityNodeInfo root, String... words) {
-                  ArrayDeque<AccessibilityNodeInfo> q=new ArrayDeque<>(); q.add(root);
-                  while(!q.isEmpty()) {
-                      AccessibilityNodeInfo n=q.remove();
-                      String z=((n.getText()==null?"":n.getText())+" "+(n.getContentDescription()==null?"":n.getContentDescription())).toLowerCase(Locale.ROOT);
-                      for(String w:words) if(z.contains(w)) return n;
-                      for(int i=0;i<n.getChildCount();i++){AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c);}
-                  }
-                  return null;
-              }
-
-              private void click(AccessibilityNodeInfo n) {
-                  AccessibilityNodeInfo x=n;
-                  while(x!=null){ if(x.isClickable()){x.performAction(AccessibilityNodeInfo.ACTION_CLICK);return;} x=x.getParent(); }
-              }
-
+          
               @Override public void onInterrupt() {}
           }
           EOF
@@ -497,11 +708,11 @@ jobs:
         shell: bash
         run: |
           ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v2.apk
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v3.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SubtitleAutoFind-v2-apk
-          path: SubtitleAutoFind-v2.apk
+          name: SubtitleAutoFind-v3-apk
+          path: SubtitleAutoFind-v3.apk
           if-no-files-found: error
