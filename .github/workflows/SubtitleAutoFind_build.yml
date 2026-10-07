@@ -1,4 +1,4 @@
-name: Build Subtitle Auto Find V4
+name: Build Subtitle Auto Find V6
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
                   applicationId 'com.subtitle.autofind'
                   minSdk 24
                   targetSdk 28
-                  versionCode 5
-                  versionName '0.5-sync-fallback'
+                  versionCode 6
+                  versionName '0.6-v11-canonical-title'
               }
           }
           EOF
@@ -86,7 +86,7 @@ jobs:
                   android:id="@+id/status"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:text="V5: detects the movie, loads the subtitle directly, and derives auto-position from DVB EPG or the visible DTV time banner. Manual Sync/seek remains available."
+                  android:text="V6: resolves localized EPG names to the canonical English title using several fallbacks, then searches the updated V11 subtitle archive. Manual Sync/seek remains available."
                   android:textSize="18sp"
                   android:paddingBottom="24dp" />
 
@@ -242,11 +242,13 @@ jobs:
                           rawTitle = cleanTitle(rawTitle);
                           final String rawForUi = rawTitle;
                           ui("Detected: " + rawForUi + "\nResolving original title…");
-                          String resolved = resolveOriginalTitle(rawTitle);
-                          String searchTitle = empty(resolved) ? rawTitle : cleanTitle(resolved);
+                          String wikidataTitle = resolveViaWikidata(rawTitle);
+                          String translatedTitle = translateToEnglish(rawTitle);
+                          String cinemetaTitle = resolveViaCinemeta(wikidataTitle, translatedTitle, rawTitle);
+                          String searchTitle = cleanTitle(firstNonEmpty(cinemetaTitle, wikidataTitle, translatedTitle, rawTitle));
 
-                          ui("Detected: " + rawForUi + "\nSearching Arabic subtitle for: " + searchTitle + "…");
-                          SubtitleMatch match = findBestSubtitle(searchTitle, rawTitle);
+                          ui("Detected: " + rawForUi + "\nEnglish/original title: " + searchTitle + "\nSearching Arabic subtitle…");
+                          SubtitleMatch match = findBestSubtitle(searchTitle, rawTitle, wikidataTitle, translatedTitle, cinemetaTitle);
                           if (match == null) {
                               fail("No matching .srt file was found in the current subtitle archive for: " + searchTitle + ". Manual Search in the original app remains available.");
                               return;
@@ -255,7 +257,7 @@ jobs:
                           String url = archiveUrl(match.fileName);
                           ui("Found: " + match.fileName + "\nLoading it through the original Subtitle Player…");
                           if (!sendToPatchedSubtitlePlayer(url)) {
-                              fail("The original Subtitle Player rejected direct loading. Install SubtitlePlayer_DIRECT_AUTO_V4.apk first (the patched original app), then try again.");
+                              fail("The original Subtitle Player rejected direct loading. Install SubtitlePlayer_V11_DIRECT_AUTO_SAFE.apk first, then try again.");
                               return;
                           }
 
@@ -293,49 +295,64 @@ jobs:
                   sendToPatchedSubtitlePlayer(Long.toString(ms));
               }
 
-              private SubtitleMatch findBestSubtitle(String primary, String fallback) throws Exception {
-                  String json = get("https://archive.org/metadata/mora25r", 10000, 30000);
+              private SubtitleMatch findBestSubtitle(String... queries) throws Exception {
+                  String json = get("https://archive.org/metadata/mora.25r", 10000, 30000);
                   JSONObject root = new JSONObject(json);
                   JSONArray files = root.optJSONArray("files");
                   if (files == null) return null;
 
-                  String q1 = norm(primary);
-                  String q2 = norm(fallback);
-                  String[] toks1 = tokens(q1);
-                  SubtitleMatch best = null;
+                  ArrayList<String> qs = new ArrayList<>();
+                  if (queries != null) {
+                      for (String q : queries) {
+                          String n = norm(q);
+                          if (!empty(n) && !qs.contains(n)) qs.add(n);
+                      }
+                  }
+                  if (qs.isEmpty()) return null;
 
+                  SubtitleMatch best = null;
                   for (int i=0;i<files.length();i++) {
                       JSONObject f = files.optJSONObject(i);
                       if (f == null) continue;
                       String name = f.optString("name", "");
                       if (!name.toLowerCase(Locale.ROOT).endsWith(".srt")) continue;
                       String n = norm(name.substring(0, name.length()-4));
-                      int score = score(n, name, q1, q2, toks1);
+                      int score = scoreMulti(n, name, qs);
                       if (score <= 0) continue;
                       if (best == null || score > best.score) best = new SubtitleMatch(name, score);
                   }
                   return best;
               }
 
-              private static int score(String n, String rawName, String q1, String q2, String[] toks) {
-                  int s = 0;
-                  if (!empty(q1) && n.contains(q1)) s += 1200;
-                  if (!empty(q2) && n.contains(q2)) s += 900;
-                  int hit = 0;
-                  for (String t : toks) if (t.length() > 1 && n.contains(t)) hit++;
-                  if (toks.length > 0 && hit == toks.length) s += 650;
-                  else s += hit * 70;
+              private static int scoreMulti(String fileNorm, String rawName, List<String> qs) {
+                  int best = 0;
+                  for (int qi=0; qi<qs.size(); qi++) {
+                      String q = qs.get(qi);
+                      int s = 0;
+                      if (fileNorm.equals(q)) s += 1800;
+                      else if (fileNorm.contains(q) || q.contains(fileNorm)) s += (qi == 0 ? 1450 : 1200);
+
+                      String[] toks = tokens(q);
+                      int hit = 0;
+                      for (String t : toks) if (t.length() > 1 && fileNorm.contains(t)) hit++;
+                      if (toks.length > 0 && hit == toks.length) s += 700;
+                      else s += hit * 80;
+
+                      s -= Math.min(260, Math.abs(fileNorm.length() - q.length()));
+                      if (s > best) best = s;
+                  }
+
                   String low = rawName.toLowerCase(Locale.ROOT);
-                  if (low.contains("arab") || low.contains("_ar") || low.contains(".ar.") || low.contains("[ar]")) s += 120;
-                  s -= Math.min(250, Math.abs(n.length() - q1.length()));
-                  return s;
+                  if (low.contains("arab") || low.contains("arabic") || low.contains("_ar") ||
+                      low.contains(".ar.") || low.contains("[ar]") || low.contains("عربي")) best += 160;
+                  return best;
               }
 
               private static String archiveUrl(String name) throws Exception {
                   String e = URLEncoder.encode(name, "UTF-8").replace("+", "%20")
                           .replace("%28", "(").replace("%29", ")")
                           .replace("%5B", "[").replace("%5D", "]");
-                  return "https://archive.org/download/mora25r/" + e;
+                  return "https://archive.org/download/mora.25r/" + e;
               }
 
               private static String[] tokens(String q) {
@@ -357,7 +374,7 @@ jobs:
               private static String get(String url, int connectTimeout, int readTimeout) throws Exception {
                   HttpURLConnection c = (HttpURLConnection)new URL(url).openConnection();
                   c.setConnectTimeout(connectTimeout); c.setReadTimeout(readTimeout); c.setRequestMethod("GET");
-                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/4 Android");
+                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/6 Android");
                   BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
                   StringBuilder out = new StringBuilder(); String line;
                   while ((line = br.readLine()) != null) out.append(line).append('\n');
@@ -396,15 +413,26 @@ jobs:
                   return s.replaceAll("\\s+", " ").trim();
               }
 
-              private static String resolveOriginalTitle(String title) {
-                  String[] langs = {"en","pl","fr","de","es","it","pt","ro","cs","sk","hu","tr","uk","ru","ar"};
+              private static String firstNonEmpty(String... values) {
+                  if (values == null) return "";
+                  for (String v : values) if (!empty(v)) return v.trim();
+                  return "";
+              }
+
+              // Stage 1: resolve a localized title through Wikidata aliases/labels.
+              private static String resolveViaWikidata(String title) {
+                  String[] langs = {
+                      "en","pl","fr","de","es","it","pt","ro","cs","sk","hu","tr","uk","ru","ar",
+                      "nl","sv","no","da","fi","el","bg","sr","hr","sl","lt","lv","et","he","fa","id"
+                  };
                   try {
                       for (String lang : langs) {
-                          String u = "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&limit=6&type=item&language="
+                          String u = "https://www.wikidata.org/w/api.php?action=wbsearchentities&format=json&limit=8&type=item&language="
                                   + lang + "&search=" + enc(title);
                           JSONObject obj = new JSONObject(get(u, 6000, 9000));
                           JSONArray arr = obj.optJSONArray("search");
                           if (arr == null || arr.length() == 0) continue;
+
                           String candidateId = null;
                           for (int i=0;i<arr.length();i++) {
                               JSONObject x = arr.optJSONObject(i);
@@ -413,11 +441,15 @@ jobs:
                               if (desc.contains("film") || desc.contains("movie") || desc.contains("television") ||
                                   desc.contains("series") || desc.contains("serial") || desc.contains("película") ||
                                   desc.contains("filme") || desc.contains("фильм") || desc.contains("фільм") ||
-                                  desc.contains("فيلم") || desc.contains("مسلسل")) {
-                                  candidateId = x.optString("id", null); break;
+                                  desc.contains("فيلم") || desc.contains("مسلسل") || desc.contains("cinema")) {
+                                  candidateId = x.optString("id", null);
+                                  break;
                               }
                           }
-                          if (candidateId == null) candidateId = arr.optJSONObject(0).optString("id", null);
+                          if (candidateId == null) {
+                              JSONObject first = arr.optJSONObject(0);
+                              if (first != null) candidateId = first.optString("id", null);
+                          }
                           if (candidateId == null || !candidateId.startsWith("Q")) continue;
 
                           String e = "https://www.wikidata.org/w/api.php?action=wbgetentities&format=json&props=labels&languages=en&ids=" + enc(candidateId);
@@ -434,7 +466,69 @@ jobs:
                           }
                       }
                   } catch (Throwable ignored) {}
-                  return title;
+                  return "";
+              }
+
+              // Stage 2: translation fallback. If Wikidata has no alias for the EPG language,
+              // translate the title instead of giving up.
+              private static String translateToEnglish(String title) {
+                  try {
+                      String u = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=" + enc(title);
+                      JSONArray root = new JSONArray(get(u, 6000, 9000));
+                      JSONArray parts = root.optJSONArray(0);
+                      if (parts == null) return "";
+                      StringBuilder out = new StringBuilder();
+                      for (int i=0;i<parts.length();i++) {
+                          JSONArray part = parts.optJSONArray(i);
+                          if (part == null) continue;
+                          String t = part.optString(0, "");
+                          if (!empty(t)) out.append(t);
+                      }
+                      String v = out.toString().trim();
+                      return v.length() < 150 ? v : "";
+                  } catch (Throwable ignored) {
+                      return "";
+                  }
+              }
+
+              // Stage 3: canonicalize the result against Cinemeta/IMDb-style metadata.
+              // This avoids literal translations when the official English release title differs.
+              private static String resolveViaCinemeta(String... queries) {
+                  try {
+                      if (queries == null) return "";
+                      String bestName = "";
+                      int bestScore = Integer.MIN_VALUE;
+                      for (String q : queries) {
+                          if (empty(q)) continue;
+                          String nq = norm(q);
+                          for (String type : new String[]{"movie","series"}) {
+                              String pathQ = URLEncoder.encode(q, "UTF-8").replace("+", "%20");
+                              String u = "https://v3-cinemeta.strem.io/catalog/" + type + "/top/search=" + pathQ + ".json";
+                              JSONObject obj = new JSONObject(get(u, 6500, 10000));
+                              JSONArray metas = obj.optJSONArray("metas");
+                              if (metas == null) continue;
+                              for (int i=0;i<Math.min(8, metas.length());i++) {
+                                  JSONObject m = metas.optJSONObject(i);
+                                  if (m == null) continue;
+                                  String name = m.optString("name", "").trim();
+                                  if (empty(name)) continue;
+                                  String nn = norm(name);
+                                  int sc = 0;
+                                  if (nn.equals(nq)) sc += 1000;
+                                  if (nn.contains(nq) || nq.contains(nn)) sc += 650;
+                                  String[] toks = tokens(nq);
+                                  int hit=0;
+                                  for (String t : toks) if (t.length()>1 && nn.contains(t)) hit++;
+                                  sc += hit * 90;
+                                  sc -= Math.min(150, Math.abs(nn.length()-nq.length()));
+                                  if (sc > bestScore) { bestScore=sc; bestName=name; }
+                              }
+                          }
+                      }
+                      return bestScore > 0 ? bestName : "";
+                  } catch (Throwable ignored) {
+                      return "";
+                  }
               }
 
               private static long elapsedFromClockText(String text) {
@@ -601,11 +695,11 @@ jobs:
         shell: bash
         run: |
           ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v5.apk
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v6.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SubtitleAutoFind-v5-apk
-          path: SubtitleAutoFind-v5.apk
+          name: SubtitleAutoFind-v6-apk
+          path: SubtitleAutoFind-v6.apk
           if-no-files-found: error
