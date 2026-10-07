@@ -1,4 +1,4 @@
-name: Build Subtitle Auto Find V6
+name: Build Subtitle Auto Find V7
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
                   applicationId 'com.subtitle.autofind'
                   minSdk 24
                   targetSdk 28
-                  versionCode 6
-                  versionName '0.6-v11-canonical-title'
+                  versionCode 7
+                  versionName '0.7-strict-match-sync-encoding'
               }
           }
           EOF
@@ -86,7 +86,7 @@ jobs:
                   android:id="@+id/status"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:text="V6: resolves localized EPG names to the canonical English title using several fallbacks, then searches the updated V11 subtitle archive. Manual Sync/seek remains available."
+                  android:text="V7: resolves localized EPG names to the canonical English title, rejects unrelated subtitle files, improves EPG start-time parsing, and retries the initial auto-position after the subtitle has loaded. Manual Sync/seek remains available."
                   android:textSize="18sp"
                   android:paddingBottom="24dp" />
 
@@ -263,13 +263,15 @@ jobs:
 
                           final long pos = elapsedMs;
                           if (pos >= 0) {
-                              // One delayed seek only. V4 sent the seek twice, which could make the manual seek bar
-                              // look as if it was fighting the user. The original SeekBar listener is left untouched.
-                              handler.postDelayed(() -> sendPosition(pos), 8000);
+                              // The Subtitle Player downloads/parses the SRT asynchronously. A seek sent too early
+                              // is ignored because its subtitle list is still empty. Retry only during initial load,
+                              // then stop so manual Seek/Sync remains fully under the user's control.
+                              handler.postDelayed(() -> sendPosition(pos), 12000);
+                              handler.postDelayed(() -> sendPosition(pos), 25000);
                           }
 
-                          ui("Subtitle sent: " + match.fileName +
-                             (pos >= 0 ? "\nAuto-position: " + formatMs(pos) + " (sent once after loading). Manual Sync/seek stays active." :
+                          ui("Subtitle sent: " + match.fileName + "\nMatch confidence: " + match.score +
+                             (pos >= 0 ? "\nAuto-position: " + formatMs(pos) + " (initial retries at 12s and 25s). Manual Sync/seek stays active." :
                                          "\nNo reliable start time was available, so use the original manual Sync/seek controls if needed."));
 
                       } catch (Exception e) {
@@ -325,27 +327,71 @@ jobs:
               }
 
               private static int scoreMulti(String fileNorm, String rawName, List<String> qs) {
-                  int best = 0;
+                  int bestBase = 0;
                   for (int qi=0; qi<qs.size(); qi++) {
                       String q = qs.get(qi);
+                      if (empty(q)) continue;
                       int s = 0;
-                      if (fileNorm.equals(q)) s += 1800;
-                      else if (fileNorm.contains(q) || q.contains(fileNorm)) s += (qi == 0 ? 1450 : 1200);
 
-                      String[] toks = tokens(q);
-                      int hit = 0;
-                      for (String t : toks) if (t.length() > 1 && fileNorm.contains(t)) hit++;
-                      if (toks.length > 0 && hit == toks.length) s += 700;
-                      else s += hit * 80;
+                      // Never accept a subtitle only because it looks Arabic. The title itself must match first.
+                      if (fileNorm.equals(q)) {
+                          s = 2200;
+                      } else if (containsPhrase(fileNorm, q)) {
+                          s = (qi == 0 ? 1900 : 1700);
+                      } else {
+                          String[] toks = meaningfulTokens(q);
+                          int hit = 0;
+                          for (String t : toks) if (hasToken(fileNorm, t)) hit++;
 
-                      s -= Math.min(260, Math.abs(fileNorm.length() - q.length()));
-                      if (s > best) best = s;
+                          if (toks.length == 1) {
+                              if (hit == 1) s = 1050;
+                          } else if (toks.length >= 2) {
+                              double ratio = (double) hit / (double) toks.length;
+                              if (hit >= 2 && ratio >= 0.67) s = 850 + hit * 150;
+                              else if (hit == toks.length && hit > 0) s = 1100 + hit * 120;
+                          }
+                      }
+
+                      if (s > 0) {
+                          s -= Math.min(180, Math.abs(fileNorm.length() - q.length()) / 2);
+                          if (qi == 0) s += 80; // canonical English title gets priority
+                      }
+                      if (s > bestBase) bestBase = s;
                   }
 
+                  // Critical V7 rule: unrelated files are rejected. V6 could add the Arabic bonus to a zero title
+                  // score, which allowed the same unrelated SRT to be selected for different movies.
+                  if (bestBase < 700) return 0;
+
+                  int bonus = 0;
                   String low = rawName.toLowerCase(Locale.ROOT);
                   if (low.contains("arab") || low.contains("arabic") || low.contains("_ar") ||
-                      low.contains(".ar.") || low.contains("[ar]") || low.contains("عربي")) best += 160;
-                  return best;
+                      low.contains(".ar.") || low.contains("[ar]") || low.contains("عربي")) bonus += 160;
+                  return bestBase + bonus;
+              }
+
+              private static boolean containsPhrase(String text, String phrase) {
+                  if (empty(text) || empty(phrase)) return false;
+                  if (text.equals(phrase)) return true;
+                  return (" " + text + " ").contains(" " + phrase + " ");
+              }
+
+              private static boolean hasToken(String text, String token) {
+                  if (empty(text) || empty(token)) return false;
+                  return (" " + text + " ").contains(" " + token + " ");
+              }
+
+              private static String[] meaningfulTokens(String q) {
+                  if (empty(q)) return new String[0];
+                  String[] all = q.split("\\s+");
+                  ArrayList<String> keep = new ArrayList<>();
+                  for (String t : all) {
+                      if (t.length() < 2) continue;
+                      if (t.equals("the") || t.equals("a") || t.equals("an") || t.equals("and") ||
+                          t.equals("of") || t.equals("in") || t.equals("on") || t.equals("part")) continue;
+                      keep.add(t);
+                  }
+                  return keep.toArray(new String[0]);
               }
 
               private static String archiveUrl(String name) throws Exception {
@@ -374,7 +420,7 @@ jobs:
               private static String get(String url, int connectTimeout, int readTimeout) throws Exception {
                   HttpURLConnection c = (HttpURLConnection)new URL(url).openConnection();
                   c.setConnectTimeout(connectTimeout); c.setReadTimeout(readTimeout); c.setRequestMethod("GET");
-                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/6 Android");
+                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/7 Android");
                   BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
                   StringBuilder out = new StringBuilder(); String line;
                   while ((line = br.readLine()) != null) out.append(line).append('\n');
@@ -562,12 +608,51 @@ jobs:
               private static long extractElapsed(String epg) {
                   try {
                       String st = pick(epg,"startTime","start_time","starttime","epg_starttime");
-                      if (st == null) return -1;
-                      long n = Long.parseLong(st.replaceAll("[^0-9]",""));
-                      if (n < 100000000000L) n *= 1000L;
-                      long d = System.currentTimeMillis() - n;
-                      return d >= 0 && d < 8L*60L*60L*1000L ? d : -1;
+                      return elapsedFromStartValue(st);
                   } catch(Exception e) { return -1; }
+              }
+
+              private static long elapsedFromStartValue(String st) {
+                  if (empty(st)) return -1;
+                  String v = st.trim();
+                  long now = System.currentTimeMillis();
+                  try {
+                      if (v.matches("\\d{10}")) {
+                          long d = now - Long.parseLong(v) * 1000L;
+                          return validElapsed(d);
+                      }
+                      if (v.matches("\\d{13}")) {
+                          long d = now - Long.parseLong(v);
+                          return validElapsed(d);
+                      }
+                      if (v.matches("\\d{14}")) {
+                          java.text.SimpleDateFormat f = new java.text.SimpleDateFormat("yyyyMMddHHmmss", Locale.US);
+                          f.setLenient(false);
+                          long d = now - f.parse(v).getTime();
+                          return validElapsed(d);
+                      }
+                  } catch (Throwable ignored) {}
+
+                  String[] formats = {
+                      "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd-HH:mm:ss", "yyyy/MM/dd HH:mm:ss",
+                      "yyyy-MM-dd HH:mm", "yyyy/MM/dd HH:mm"
+                  };
+                  for (String fmt : formats) {
+                      try {
+                          java.text.SimpleDateFormat f = new java.text.SimpleDateFormat(fmt, Locale.US);
+                          f.setLenient(false);
+                          long d = now - f.parse(v).getTime();
+                          long ok = validElapsed(d);
+                          if (ok >= 0) return ok;
+                      } catch (Throwable ignored) {}
+                  }
+
+                  // Last fallback: EPG values such as "08:30", "08:30 - 10:45", etc.
+                  return elapsedFromClockText(v);
+              }
+
+              private static long validElapsed(long d) {
+                  return d >= 0 && d < 8L * 60L * 60L * 1000L ? d : -1;
               }
 
               private static String html(String s) {
@@ -695,11 +780,11 @@ jobs:
         shell: bash
         run: |
           ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v6.apk
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v7.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SubtitleAutoFind-v6-apk
-          path: SubtitleAutoFind-v6.apk
+          name: SubtitleAutoFind-v7-apk
+          path: SubtitleAutoFind-v7.apk
           if-no-files-found: error
