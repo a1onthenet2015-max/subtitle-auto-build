@@ -60,8 +60,8 @@ jobs:
                   applicationId 'com.subtitle.autofind'
                   minSdk 24
                   targetSdk 28
-                  versionCode 4
-                  versionName '0.4-direct-service'
+                  versionCode 5
+                  versionName '0.5-sync-fallback'
               }
           }
           EOF
@@ -86,7 +86,7 @@ jobs:
                   android:id="@+id/status"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:text="V4: detects the movie, finds the online subtitle itself, then sends the subtitle URL directly to the patched original Subtitle Player."
+                  android:text="V5: detects the movie, loads the subtitle directly, and derives auto-position from DVB EPG or the visible DTV time banner. Manual Sync/seek remains available."
                   android:textSize="18sp"
                   android:paddingBottom="24dp" />
 
@@ -173,6 +173,7 @@ jobs:
           import java.util.ArrayList;
           import java.util.List;
           import java.util.Locale;
+          import java.util.Calendar;
           import java.util.regex.Matcher;
           import java.util.regex.Pattern;
 
@@ -217,14 +218,20 @@ jobs:
                           }
 
                           long elapsedMs = extractElapsed(epg);
+                          long seen = getSharedPreferences("auto", MODE_PRIVATE).getLong("last_dtv_seen", 0);
+                          String cached = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_title", null);
+                          String cachedTime = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_time", null);
 
                           if (empty(rawTitle)) {
-                              long seen = getSharedPreferences("auto", MODE_PRIVATE).getLong("last_dtv_seen", 0);
-                              String cached = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_title", null);
                               if (!empty(cached) && System.currentTimeMillis() - seen < 10L * 60L * 1000L) {
                                   rawTitle = cached;
-                                  elapsedMs = -1;
                               }
+                          }
+
+                          // Some channels expose the current title through the DTV banner but not through the DVB JSON.
+                          // In that case recover the start time from barEpgInfoNowTime / the visible INFO banner.
+                          if (elapsedMs < 0 && System.currentTimeMillis() - seen < 10L * 60L * 1000L) {
+                              elapsedMs = elapsedFromClockText(cachedTime);
                           }
 
                           if (empty(rawTitle)) {
@@ -254,13 +261,13 @@ jobs:
 
                           final long pos = elapsedMs;
                           if (pos >= 0) {
-                              // The original loader is asynchronous. Two attempts make auto-position tolerant of slower receivers.
-                              handler.postDelayed(() -> sendPosition(pos), 3500);
-                              handler.postDelayed(() -> sendPosition(pos), 7000);
+                              // One delayed seek only. V4 sent the seek twice, which could make the manual seek bar
+                              // look as if it was fighting the user. The original SeekBar listener is left untouched.
+                              handler.postDelayed(() -> sendPosition(pos), 8000);
                           }
 
                           ui("Subtitle sent: " + match.fileName +
-                             (pos >= 0 ? "\nAuto-position will be attempted from EPG time. Manual Sync/seek controls remain unchanged." :
+                             (pos >= 0 ? "\nAuto-position: " + formatMs(pos) + " (sent once after loading). Manual Sync/seek stays active." :
                                          "\nNo reliable start time was available, so use the original manual Sync/seek controls if needed."));
 
                       } catch (Exception e) {
@@ -430,6 +437,34 @@ jobs:
                   return title;
               }
 
+              private static long elapsedFromClockText(String text) {
+                  if (empty(text)) return -1;
+                  try {
+                      Matcher m = Pattern.compile("(?<!\\d)([01]?\\d|2[0-3])[:.]([0-5]\\d)(?!\\d)").matcher(text);
+                      if (!m.find()) return -1;
+                      int hh = Integer.parseInt(m.group(1));
+                      int mm = Integer.parseInt(m.group(2));
+                      Calendar now = Calendar.getInstance();
+                      Calendar start = (Calendar) now.clone();
+                      start.set(Calendar.HOUR_OF_DAY, hh);
+                      start.set(Calendar.MINUTE, mm);
+                      start.set(Calendar.SECOND, 0);
+                      start.set(Calendar.MILLISECOND, 0);
+                      // A programme that began before midnight can still be on air after midnight.
+                      if (start.getTimeInMillis() - now.getTimeInMillis() > 60L * 60L * 1000L) {
+                          start.add(Calendar.DAY_OF_MONTH, -1);
+                      }
+                      long d = now.getTimeInMillis() - start.getTimeInMillis();
+                      return d >= 0 && d < 8L * 60L * 60L * 1000L ? d : -1;
+                  } catch (Throwable t) { return -1; }
+              }
+
+              private static String formatMs(long ms) {
+                  if (ms < 0) return "--:--:--";
+                  long sec = ms / 1000L;
+                  return String.format(Locale.US, "%02d:%02d:%02d", sec/3600L, (sec/60L)%60L, sec%60L);
+              }
+
               private static long extractElapsed(String epg) {
                   try {
                       String st = pick(epg,"startTime","start_time","starttime","epg_starttime");
@@ -485,11 +520,30 @@ jobs:
                   String channel = findByIdWords(root, false, "channel", "name");
                   if (empty(channel)) channel = findByIdWords(root, false, "service", "name");
 
+                  String time = textById(root, DTV + ":id/barEpgInfoNowTime");
+                  if (empty(time)) time = textById(root, DTV + ":id/barEpgInfoNowDuration");
+                  if (empty(time)) time = findByIdWords(root, true, "epg", "now", "time");
+                  if (empty(time)) time = findByIdWords(root, true, "program", "time");
+                  if (empty(time)) time = findLikelyClockText(root);
+
                   android.content.SharedPreferences.Editor e = getSharedPreferences("auto", MODE_PRIVATE).edit();
                   if (!empty(title)) e.putString("last_dtv_title", clean(title));
                   if (!empty(channel)) e.putString("last_dtv_channel", clean(channel));
-                  if (!empty(title) || !empty(channel)) e.putLong("last_dtv_seen", System.currentTimeMillis());
+                  if (!empty(time)) e.putString("last_dtv_time", clean(time));
+                  if (!empty(title) || !empty(channel) || !empty(time)) e.putLong("last_dtv_seen", System.currentTimeMillis());
                   e.apply();
+              }
+
+              private String findLikelyClockText(AccessibilityNodeInfo root) {
+                  ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
+                  java.util.regex.Pattern p = java.util.regex.Pattern.compile(".*(?:[01]?\\d|2[0-3])[:.]([0-5]\\d).*");
+                  while (!q.isEmpty()) {
+                      AccessibilityNodeInfo n = q.remove();
+                      String t = nodeText(n);
+                      if (!empty(t) && t.length() < 80 && p.matcher(t).matches()) return t;
+                      for (int i=0;i<n.getChildCount();i++) { AccessibilityNodeInfo c=n.getChild(i); if(c!=null) q.add(c); }
+                  }
+                  return null;
               }
 
               private String textById(AccessibilityNodeInfo root, String id) {
@@ -547,11 +601,11 @@ jobs:
         shell: bash
         run: |
           ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v4.apk
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v5.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SubtitleAutoFind-v4-apk
-          path: SubtitleAutoFind-v4.apk
+          name: SubtitleAutoFind-v5-apk
+          path: SubtitleAutoFind-v5.apk
           if-no-files-found: error
