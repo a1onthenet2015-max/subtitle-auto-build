@@ -1,4 +1,4 @@
-name: Build Subtitle Auto Find V7
+name: Build Subtitle Auto Find V9
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
                   applicationId 'com.subtitle.autofind'
                   minSdk 24
                   targetSdk 28
-                  versionCode 7
-                  versionName '0.7-strict-match-sync-encoding'
+                  versionCode 9
+                  versionName '0.9-real-runtime-commercial-aware'
               }
           }
           EOF
@@ -86,7 +86,7 @@ jobs:
                   android:id="@+id/status"
                   android:layout_width="match_parent"
                   android:layout_height="wrap_content"
-                  android:text="V7: resolves localized EPG names to the canonical English title, rejects unrelated subtitle files, improves EPG start-time parsing, and retries the initial auto-position after the subtitle has loaded. Manual Sync/seek remains available."
+                  android:text="V9: resolves the canonical English title and real movie runtime, matches SRT duration to the real movie instead of the ad-filled EPG slot, estimates the initial position from broadcast progress when commercials are present, then returns to DTV automatically. Manual Sync/seek remains available."
                   android:textSize="18sp"
                   android:paddingBottom="24dp" />
 
@@ -218,9 +218,11 @@ jobs:
                           }
 
                           long elapsedMs = extractElapsed(epg);
+                          long programDurationMs = extractProgramDuration(epg);
                           long seen = getSharedPreferences("auto", MODE_PRIVATE).getLong("last_dtv_seen", 0);
                           String cached = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_title", null);
                           String cachedTime = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_time", null);
+                          String cachedDuration = getSharedPreferences("auto", MODE_PRIVATE).getString("last_dtv_duration", null);
 
                           if (empty(rawTitle)) {
                               if (!empty(cached) && System.currentTimeMillis() - seen < 10L * 60L * 1000L) {
@@ -230,8 +232,9 @@ jobs:
 
                           // Some channels expose the current title through the DTV banner but not through the DVB JSON.
                           // In that case recover the start time from barEpgInfoNowTime / the visible INFO banner.
-                          if (elapsedMs < 0 && System.currentTimeMillis() - seen < 10L * 60L * 1000L) {
-                              elapsedMs = elapsedFromClockText(cachedTime);
+                          if (System.currentTimeMillis() - seen < 10L * 60L * 1000L) {
+                              if (elapsedMs < 0) elapsedMs = elapsedFromClockText(cachedTime);
+                              if (programDurationMs < 0) programDurationMs = durationFromText(cachedDuration);
                           }
 
                           if (empty(rawTitle)) {
@@ -244,35 +247,63 @@ jobs:
                           ui("Detected: " + rawForUi + "\nResolving original title…");
                           String wikidataTitle = resolveViaWikidata(rawTitle);
                           String translatedTitle = translateToEnglish(rawTitle);
-                          String cinemetaTitle = resolveViaCinemeta(wikidataTitle, translatedTitle, rawTitle);
+                          int epgYear = extractYear(epg + " " + rawTitle);
+                          CanonicalMeta canonical = resolveViaCinemeta(programDurationMs, epgYear, wikidataTitle, translatedTitle, rawTitle);
+                          String cinemetaTitle = canonical == null ? "" : canonical.title;
+                          long realRuntimeMs = canonical == null ? -1L : canonical.runtimeMs;
                           String searchTitle = cleanTitle(firstNonEmpty(cinemetaTitle, wikidataTitle, translatedTitle, rawTitle));
 
-                          ui("Detected: " + rawForUi + "\nEnglish/original title: " + searchTitle + "\nSearching Arabic subtitle…");
-                          SubtitleMatch match = findBestSubtitle(searchTitle, rawTitle, wikidataTitle, translatedTitle, cinemetaTitle);
+                          ui("Detected: " + rawForUi + "\nEnglish/original title: " + searchTitle +
+                             (realRuntimeMs > 0 ? "\nReal movie runtime: " + formatMs(realRuntimeMs) : "") +
+                             (programDurationMs > 0 ? "\nEPG slot: " + formatMs(programDurationMs) : "") +
+                             "\nSearching Arabic subtitle and matching it to the real movie runtime…");
+                          SubtitleMatch match = findBestSubtitle(realRuntimeMs, searchTitle, rawTitle, wikidataTitle, translatedTitle, cinemetaTitle);
                           if (match == null) {
-                              fail("No matching .srt file was found in the current subtitle archive for: " + searchTitle + ". Manual Search in the original app remains available.");
+                              fail("No subtitle matched the detected title" +
+                                   (realRuntimeMs > 0 ? " and real movie runtime " + formatMs(realRuntimeMs) : "") +
+                                   " closely enough for: " + searchTitle + ". Nothing was loaded. Manual Search remains available.");
                               return;
                           }
 
                           String url = archiveUrl(match.fileName);
-                          ui("Found: " + match.fileName + "\nLoading it through the original Subtitle Player…");
+                          ui("Found: " + match.fileName +
+                             (match.subtitleDurationMs > 0 ? "\nSubtitle runtime: " + formatMs(match.subtitleDurationMs) : "") +
+                             "\nLoading it through the original Subtitle Player…");
                           if (!sendToPatchedSubtitlePlayer(url)) {
-                              fail("The original Subtitle Player rejected direct loading. Install SubtitlePlayer_V11_DIRECT_AUTO_SAFE.apk first, then try again.");
+                              fail("The original Subtitle Player rejected direct loading. Install SubtitlePlayer_V11_DIRECT_AUTO_SAFE2.apk first, then try again.");
                               return;
                           }
 
-                          final long pos = elapsedMs;
+                          long contentRuntimeMs = realRuntimeMs > 0 ? realRuntimeMs : match.subtitleDurationMs;
+                          long computedPos = estimateContentPosition(elapsedMs, programDurationMs, contentRuntimeMs, match.subtitleDurationMs);
+                          boolean scaled = computedPos >= 0 && elapsedMs >= 0 && Math.abs(computedPos - elapsedMs) > 30_000L;
+
+                          final long pos = computedPos;
+                          final boolean wasScaled = scaled;
+                          final long epgDurationFinal = programDurationMs;
+                          final long realRuntimeFinal = realRuntimeMs;
                           if (pos >= 0) {
-                              // The Subtitle Player downloads/parses the SRT asynchronously. A seek sent too early
-                              // is ignored because its subtitle list is still empty. Retry only during initial load,
-                              // then stop so manual Seek/Sync remains fully under the user's control.
+                              // Retry during initial load only. After the last retry V9 returns to DTV and never
+                              // touches the timeline again, so the original manual Seek/Sync controls stay yours.
+                              handler.postDelayed(() -> sendPosition(pos), 6000);
                               handler.postDelayed(() -> sendPosition(pos), 12000);
-                              handler.postDelayed(() -> sendPosition(pos), 25000);
+                              handler.postDelayed(() -> {
+                                  sendPosition(pos);
+                                  returnToDtv();
+                              }, 18000);
+                          } else {
+                              // Subtitle load succeeded but no trustworthy clock was available. Return to DTV
+                              // after allowing the player a few seconds to parse the file.
+                              handler.postDelayed(this::returnToDtv, 7000);
                           }
 
                           ui("Subtitle sent: " + match.fileName + "\nMatch confidence: " + match.score +
-                             (pos >= 0 ? "\nAuto-position: " + formatMs(pos) + " (initial retries at 12s and 25s). Manual Sync/seek stays active." :
-                                         "\nNo reliable start time was available, so use the original manual Sync/seek controls if needed."));
+                             (match.subtitleDurationMs > 0 ? "\nSubtitle runtime: " + formatMs(match.subtitleDurationMs) : "") +
+                             (realRuntimeFinal > 0 ? "\nReal movie runtime: " + formatMs(realRuntimeFinal) : "") +
+                             (epgDurationFinal > 0 ? "\nEPG slot: " + formatMs(epgDurationFinal) : "") +
+                             (pos >= 0 ? "\nInitial auto-position: " + formatMs(pos) + (wasScaled ? " (commercial-aware estimate)" : "") +
+                                          "\nReturning to the TV channel automatically after the final sync attempt." :
+                                         "\nNo reliable start time was available. Returning to TV after loading; manual Sync/seek stays available."));
 
                       } catch (Exception e) {
                           fail("AUTO FIND error: " + safe(e.getMessage()));
@@ -297,7 +328,20 @@ jobs:
                   sendToPatchedSubtitlePlayer(Long.toString(ms));
               }
 
-              private SubtitleMatch findBestSubtitle(String... queries) throws Exception {
+              private void returnToDtv() {
+                  runOnUiThread(() -> {
+                      try {
+                          Intent tv = getPackageManager().getLaunchIntentForPackage("com.tiartoptv.dvb");
+                          if (tv != null) {
+                              tv.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                              startActivity(tv);
+                          }
+                      } catch (Throwable ignored) {}
+                      finish();
+                  });
+              }
+
+              private SubtitleMatch findBestSubtitle(long realRuntimeMs, String... queries) throws Exception {
                   String json = get("https://archive.org/metadata/mora.25r", 10000, 30000);
                   JSONObject root = new JSONObject(json);
                   JSONArray files = root.optJSONArray("files");
@@ -312,7 +356,9 @@ jobs:
                   }
                   if (qs.isEmpty()) return null;
 
-                  SubtitleMatch best = null;
+                  // First rank by title only. EPG duration is intentionally NOT used here because TV slots
+                  // may include commercials, bumpers and padding that are not part of the movie/SRT.
+                  ArrayList<SubtitleMatch> candidates = new ArrayList<>();
                   for (int i=0;i<files.length();i++) {
                       JSONObject f = files.optJSONObject(i);
                       if (f == null) continue;
@@ -321,9 +367,60 @@ jobs:
                       String n = norm(name.substring(0, name.length()-4));
                       int score = scoreMulti(n, name, qs);
                       if (score <= 0) continue;
-                      if (best == null || score > best.score) best = new SubtitleMatch(name, score);
+                      insertCandidate(candidates, new SubtitleMatch(name, score, -1L, -1L));
+                      if (candidates.size() > 14) candidates.remove(candidates.size()-1);
                   }
-                  return best;
+                  if (candidates.isEmpty()) return null;
+
+                  // When the real movie runtime is known from Cinemeta/IMDb metadata, compare SRT runtime
+                  // against THAT value, never against the ad-filled EPG slot. A generous tolerance allows
+                  // releases that omit credits or have small PAL/NTSC timing differences.
+                  if (realRuntimeMs > 0) {
+                      SubtitleMatch best = null;
+                      long tolerance = Math.max(12L * 60L * 1000L, (long)(realRuntimeMs * 0.15));
+                      for (SubtitleMatch c : candidates) {
+                          long subDuration = fetchSrtDurationMs(c.fileName);
+                          if (subDuration <= 0) continue;
+                          long diff = Math.abs(realRuntimeMs - subDuration);
+                          if (diff > tolerance) continue;
+                          int durationBonus = (int)Math.max(0L, 1100L - (diff / 60000L) * 24L);
+                          SubtitleMatch scored = new SubtitleMatch(c.fileName, c.score + durationBonus, subDuration, diff);
+                          if (best == null || scored.score > best.score ||
+                              (scored.score == best.score && scored.durationDiffMs < best.durationDiffMs)) best = scored;
+                      }
+                      return best;
+                  }
+
+                  // If real runtime is unavailable, never reject by EPG duration. Keep the strongest title match
+                  // and measure its SRT duration only for display/initial-position estimation.
+                  SubtitleMatch top = candidates.get(0);
+                  long d = fetchSrtDurationMs(top.fileName);
+                  return new SubtitleMatch(top.fileName, top.score, d, -1L);
+              }
+
+              private static void insertCandidate(ArrayList<SubtitleMatch> list, SubtitleMatch item) {
+                  int at = 0;
+                  while (at < list.size() && list.get(at).score >= item.score) at++;
+                  list.add(at, item);
+              }
+
+              private static long fetchSrtDurationMs(String fileName) {
+                  try {
+                      String body = get(archiveUrl(fileName), 8000, 16000);
+                      Matcher m = Pattern.compile("(?m)(\\d{1,2}):([0-5]\\d):([0-5]\\d)[,.](\\d{3})").matcher(body);
+                      long max = -1L;
+                      while (m.find()) {
+                          long h = Long.parseLong(m.group(1));
+                          long min = Long.parseLong(m.group(2));
+                          long sec = Long.parseLong(m.group(3));
+                          long ms = Long.parseLong(m.group(4));
+                          long t = (((h * 60L) + min) * 60L + sec) * 1000L + ms;
+                          if (t > max) max = t;
+                      }
+                      return max;
+                  } catch (Throwable ignored) {
+                      return -1L;
+                  }
               }
 
               private static int scoreMulti(String fileNorm, String rawName, List<String> qs) {
@@ -413,14 +510,16 @@ jobs:
               }
 
               private static class SubtitleMatch {
-                  final String fileName; final int score;
-                  SubtitleMatch(String f, int s) { fileName=f; score=s; }
+                  final String fileName; final int score; final long subtitleDurationMs; final long durationDiffMs;
+                  SubtitleMatch(String f, int s, long d, long diff) {
+                      fileName=f; score=s; subtitleDurationMs=d; durationDiffMs=diff;
+                  }
               }
 
               private static String get(String url, int connectTimeout, int readTimeout) throws Exception {
                   HttpURLConnection c = (HttpURLConnection)new URL(url).openConnection();
                   c.setConnectTimeout(connectTimeout); c.setReadTimeout(readTimeout); c.setRequestMethod("GET");
-                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/7 Android");
+                  c.setRequestProperty("User-Agent", "SubtitleAutoFind/9 Android");
                   BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream()));
                   StringBuilder out = new StringBuilder(); String line;
                   while ((line = br.readLine()) != null) out.append(line).append('\n');
@@ -539,11 +638,12 @@ jobs:
 
               // Stage 3: canonicalize the result against Cinemeta/IMDb-style metadata.
               // This avoids literal translations when the official English release title differs.
-              private static String resolveViaCinemeta(String... queries) {
+              // Stage 3: canonicalize against Cinemeta and retrieve the real movie runtime.
+              // EPG duration is used only as a SOFT disambiguation hint because it may contain commercials.
+              private static CanonicalMeta resolveViaCinemeta(long epgDurationMs, int epgYear, String... queries) {
                   try {
-                      if (queries == null) return "";
-                      String bestName = "";
-                      int bestScore = Integer.MIN_VALUE;
+                      if (queries == null) return null;
+                      ArrayList<MetaCandidate> list = new ArrayList<>();
                       for (String q : queries) {
                           if (empty(q)) continue;
                           String nq = norm(q);
@@ -557,24 +657,234 @@ jobs:
                                   JSONObject m = metas.optJSONObject(i);
                                   if (m == null) continue;
                                   String name = m.optString("name", "").trim();
+                                  String id = m.optString("id", "").trim();
                                   if (empty(name)) continue;
                                   String nn = norm(name);
                                   int sc = 0;
-                                  if (nn.equals(nq)) sc += 1000;
+                                  if (nn.equals(nq)) sc += 1200;
                                   if (nn.contains(nq) || nq.contains(nn)) sc += 650;
                                   String[] toks = tokens(nq);
                                   int hit=0;
-                                  for (String t : toks) if (t.length()>1 && nn.contains(t)) hit++;
-                                  sc += hit * 90;
-                                  sc -= Math.min(150, Math.abs(nn.length()-nq.length()));
-                                  if (sc > bestScore) { bestScore=sc; bestName=name; }
+                                  for (String t : toks) if (t.length()>1 && hasToken(nn,t)) hit++;
+                                  sc += hit * 100;
+                                  sc -= Math.min(180, Math.abs(nn.length()-nq.length()));
+
+                                  int year = yearFromText(m.optString("releaseInfo", ""));
+                                  if (epgYear > 0 && year > 0) {
+                                      if (year == epgYear) sc += 350;
+                                      else if (Math.abs(year-epgYear) == 1) sc += 120;
+                                      else sc -= Math.min(300, Math.abs(year-epgYear) * 35);
+                                  }
+                                  long runtime = runtimeStringToMs(m.optString("runtime", ""));
+                                  insertMetaCandidate(list, new MetaCandidate(name,id,type,sc,runtime,year));
+                                  if (list.size() > 8) list.remove(list.size()-1);
                               }
                           }
                       }
-                      return bestScore > 0 ? bestName : "";
+                      if (list.isEmpty()) return null;
+
+                      MetaCandidate best = null;
+                      int bestScore = Integer.MIN_VALUE;
+                      for (int i=0;i<Math.min(6,list.size());i++) {
+                          MetaCandidate c = list.get(i);
+                          long runtime = c.runtimeMs;
+                          String canonicalName = c.name;
+                          int year = c.year;
+                          if (!empty(c.id) && c.id.startsWith("tt")) {
+                              try {
+                                  String u = "https://v3-cinemeta.strem.io/meta/" + c.type + "/" + enc(c.id) + ".json";
+                                  JSONObject meta = new JSONObject(get(u, 6500, 10000)).optJSONObject("meta");
+                                  if (meta != null) {
+                                      String n = meta.optString("name", "").trim();
+                                      if (!empty(n)) canonicalName = n;
+                                      long r = runtimeStringToMs(meta.optString("runtime", ""));
+                                      if (r > 0) runtime = r;
+                                      int y = yearFromText(meta.optString("releaseInfo", ""));
+                                      if (y > 0) year = y;
+                                  }
+                              } catch (Throwable ignored) {}
+                          }
+
+                          int sc = c.score;
+                          // Soft runtime clue only: a TV slot normally cannot be much shorter than the movie,
+                          // while a longer slot is expected when commercials are inserted. Never hard-reject here.
+                          if (epgDurationMs > 0 && runtime > 0) {
+                              long delta = epgDurationMs - runtime;
+                              if (delta >= -5L*60L*1000L && delta <= 90L*60L*1000L) {
+                                  long mins = Math.abs(delta) / 60000L;
+                                  sc += (int)Math.max(0L, 260L - mins * 4L);
+                              } else if (runtime > epgDurationMs + 20L*60L*1000L) {
+                                  sc -= 220;
+                              }
+                          }
+                          if (epgYear > 0 && year > 0 && year == epgYear) sc += 180;
+
+                          if (best == null || sc > bestScore) {
+                              bestScore = sc;
+                              best = new MetaCandidate(canonicalName,c.id,c.type,sc,runtime,year);
+                          }
+                      }
+                      return best == null ? null : new CanonicalMeta(best.name,best.id,best.type,best.runtimeMs,best.year,bestScore);
                   } catch (Throwable ignored) {
-                      return "";
+                      return null;
                   }
+              }
+
+              private static void insertMetaCandidate(ArrayList<MetaCandidate> list, MetaCandidate item) {
+                  int at=0;
+                  while (at<list.size() && list.get(at).score>=item.score) at++;
+                  list.add(at,item);
+              }
+
+              private static int extractYear(String text) {
+                  return yearFromText(text);
+              }
+
+              private static int yearFromText(String text) {
+                  if (empty(text)) return -1;
+                  try {
+                      Matcher m=Pattern.compile("(?<!\\d)((?:19|20)\\d{2})(?!\\d)").matcher(text);
+                      if (m.find()) return Integer.parseInt(m.group(1));
+                  } catch (Throwable ignored) {}
+                  return -1;
+              }
+
+              private static long runtimeStringToMs(String value) {
+                  if (empty(value)) return -1L;
+                  String v=value.toLowerCase(Locale.ROOT).trim();
+                  try {
+                      Matcher hm=Pattern.compile("(?:(\\d+)\\s*h(?:ours?)?)?\\s*(?:(\\d+)\\s*m(?:in(?:utes?)?)?)?").matcher(v);
+                      if (hm.find()) {
+                          long h=empty(hm.group(1))?0:Long.parseLong(hm.group(1));
+                          long m=empty(hm.group(2))?0:Long.parseLong(hm.group(2));
+                          long ms=(h*60L+m)*60L*1000L;
+                          if (ms>=20L*60L*1000L && ms<=8L*60L*60L*1000L) return ms;
+                      }
+                      Matcher only=Pattern.compile("(?<!\\d)(\\d{2,3})\\s*(?:m|min|mins|minutes)(?![a-z])").matcher(v);
+                      if (only.find()) {
+                          long m=Long.parseLong(only.group(1));
+                          long ms=m*60L*1000L;
+                          if (ms>=20L*60L*1000L && ms<=8L*60L*60L*1000L) return ms;
+                      }
+                      Matcher colon=Pattern.compile("(?<!\\d)(\\d{1,2}):([0-5]\\d)(?::([0-5]\\d))?(?!\\d)").matcher(v);
+                      if (colon.find()) {
+                          long a=Long.parseLong(colon.group(1)), b=Long.parseLong(colon.group(2));
+                          long sec=empty(colon.group(3))?0:Long.parseLong(colon.group(3));
+                          long ms=((a*60L+b)*60L+sec)*1000L;
+                          if (ms>=20L*60L*1000L && ms<=8L*60L*60L*1000L) return ms;
+                      }
+                  } catch (Throwable ignored) {}
+                  return -1L;
+              }
+
+              private static long estimateContentPosition(long elapsedMs, long epgDurationMs, long realRuntimeMs, long subtitleRuntimeMs) {
+                  if (elapsedMs < 0) return -1L;
+                  long targetRuntime = subtitleRuntimeMs > 0 ? subtitleRuntimeMs : realRuntimeMs;
+                  if (targetRuntime <= 0) return elapsedMs;
+
+                  long pos = elapsedMs;
+                  if (epgDurationMs > 0 && realRuntimeMs > 0) {
+                      long adOverhead = epgDurationMs - realRuntimeMs;
+                      // If the slot is materially longer than the real movie, scale broadcast progress into
+                      // content progress. This is only an INITIAL estimate because commercials are not evenly
+                      // distributed; the original manual Sync/seek remains available for correction.
+                      if (adOverhead > 5L * 60L * 1000L) {
+                          double ratio = Math.max(0.55, Math.min(1.0, (double)realRuntimeMs/(double)epgDurationMs));
+                          pos = (long)(elapsedMs * ratio);
+                      }
+                  }
+                  if (realRuntimeMs > 0 && subtitleRuntimeMs > 0 && Math.abs(realRuntimeMs-subtitleRuntimeMs) > 60_000L) {
+                      pos = (long)((double)pos * (double)subtitleRuntimeMs / (double)realRuntimeMs);
+                  }
+                  if (pos < 0) pos=0;
+                  if (subtitleRuntimeMs > 0 && pos > subtitleRuntimeMs) pos=subtitleRuntimeMs;
+                  return pos;
+              }
+
+              private static class MetaCandidate {
+                  final String name,id,type; final int score; final long runtimeMs; final int year;
+                  MetaCandidate(String n,String i,String t,int s,long r,int y){name=n;id=i;type=t;score=s;runtimeMs=r;year=y;}
+              }
+
+              private static class CanonicalMeta {
+                  final String title,id,type; final long runtimeMs; final int year,score;
+                  CanonicalMeta(String t,String i,String ty,long r,int y,int s){title=t;id=i;type=ty;runtimeMs=r;year=y;score=s;}
+              }
+
+              private static long extractProgramDuration(String epg) {
+                  if (empty(epg)) return -1L;
+                  try {
+                      String dur = pick(epg, "duration", "eventDuration", "epgDuration", "programDuration");
+                      long parsed = durationFromValue(dur);
+                      if (parsed > 0) return parsed;
+
+                      String st = pick(epg, "startTime", "start_time", "starttime", "epg_starttime");
+                      String en = pick(epg, "endTime", "end_time", "endtime", "epg_endtime");
+                      long start = absoluteTimeFromValue(st);
+                      long end = absoluteTimeFromValue(en);
+                      if (start > 0 && end > 0) {
+                          if (end < start) end += 24L * 60L * 60L * 1000L;
+                          long d = end - start;
+                          if (d >= 10L * 60L * 1000L && d <= 8L * 60L * 60L * 1000L) return d;
+                      }
+                  } catch (Throwable ignored) {}
+                  return -1L;
+              }
+
+              private static long durationFromValue(String v) {
+                  if (empty(v)) return -1L;
+                  String x = v.trim();
+                  try {
+                      if (x.matches("\\d+")) {
+                          long n = Long.parseLong(x);
+                          // DVB/EPG APIs commonly use seconds; very large values may already be ms.
+                          long ms = n > 1000000L ? n : n * 1000L;
+                          if (ms >= 10L*60L*1000L && ms <= 8L*60L*60L*1000L) return ms;
+                      }
+                  } catch (Throwable ignored) {}
+                  return durationFromText(x);
+              }
+
+              private static long durationFromText(String text) {
+                  if (empty(text)) return -1L;
+                  try {
+                      Matcher hms = Pattern.compile("(?<!\\d)(\\d{1,2}):([0-5]\\d):([0-5]\\d)(?!\\d)").matcher(text);
+                      long best = -1L;
+                      while (hms.find()) {
+                          long h=Long.parseLong(hms.group(1)), m=Long.parseLong(hms.group(2)), sec=Long.parseLong(hms.group(3));
+                          long d=((h*60L+m)*60L+sec)*1000L;
+                          if (d >= 10L*60L*1000L && d <= 8L*60L*60L*1000L && d > best) best=d;
+                      }
+                      return best;
+                  } catch (Throwable t) { return -1L; }
+              }
+
+              private static long absoluteTimeFromValue(String value) {
+                  if (empty(value)) return -1L;
+                  String v=value.trim();
+                  try {
+                      if (v.matches("\\d{10}")) return Long.parseLong(v)*1000L;
+                      if (v.matches("\\d{13}")) return Long.parseLong(v);
+                      if (v.matches("\\d{14}")) {
+                          java.text.SimpleDateFormat f=new java.text.SimpleDateFormat("yyyyMMddHHmmss", Locale.US);
+                          f.setLenient(false); return f.parse(v).getTime();
+                      }
+                  } catch (Throwable ignored) {}
+                  String[] fmts={"yyyy-MM-dd HH:mm:ss","yyyy-MM-dd-HH:mm:ss","yyyy/MM/dd HH:mm:ss","yyyy-MM-dd HH:mm","yyyy/MM/dd HH:mm"};
+                  for(String fmt:fmts){
+                      try{ java.text.SimpleDateFormat f=new java.text.SimpleDateFormat(fmt,Locale.US); f.setLenient(false); return f.parse(v).getTime(); }catch(Throwable ignored){}
+                  }
+                  try {
+                      Matcher m=Pattern.compile("(?<!\\d)([01]?\\d|2[0-3])[:.]([0-5]\\d)(?!\\d)").matcher(v);
+                      if(m.find()){
+                          int hh=Integer.parseInt(m.group(1)), mm=Integer.parseInt(m.group(2));
+                          Calendar now=Calendar.getInstance(); Calendar c=(Calendar)now.clone();
+                          c.set(Calendar.HOUR_OF_DAY,hh); c.set(Calendar.MINUTE,mm); c.set(Calendar.SECOND,0); c.set(Calendar.MILLISECOND,0);
+                          if(c.getTimeInMillis()-now.getTimeInMillis()>12L*60L*60L*1000L) c.add(Calendar.DAY_OF_MONTH,-1);
+                          return c.getTimeInMillis();
+                      }
+                  } catch(Throwable ignored){}
+                  return -1L;
               }
 
               private static long elapsedFromClockText(String text) {
@@ -700,17 +1010,36 @@ jobs:
                   if (empty(channel)) channel = findByIdWords(root, false, "service", "name");
 
                   String time = textById(root, DTV + ":id/barEpgInfoNowTime");
-                  if (empty(time)) time = textById(root, DTV + ":id/barEpgInfoNowDuration");
                   if (empty(time)) time = findByIdWords(root, true, "epg", "now", "time");
                   if (empty(time)) time = findByIdWords(root, true, "program", "time");
                   if (empty(time)) time = findLikelyClockText(root);
+
+                  String duration = textById(root, DTV + ":id/barEpgInfoNowDuration");
+                  if (empty(duration)) duration = findByIdWords(root, true, "epg", "now", "duration");
+                  if (empty(duration)) duration = findByIdWords(root, true, "program", "duration");
+                  if (empty(duration)) duration = findLikelyDurationText(root);
 
                   android.content.SharedPreferences.Editor e = getSharedPreferences("auto", MODE_PRIVATE).edit();
                   if (!empty(title)) e.putString("last_dtv_title", clean(title));
                   if (!empty(channel)) e.putString("last_dtv_channel", clean(channel));
                   if (!empty(time)) e.putString("last_dtv_time", clean(time));
-                  if (!empty(title) || !empty(channel) || !empty(time)) e.putLong("last_dtv_seen", System.currentTimeMillis());
+                  if (!empty(duration)) e.putString("last_dtv_duration", clean(duration));
+                  if (!empty(title) || !empty(channel) || !empty(time) || !empty(duration)) e.putLong("last_dtv_seen", System.currentTimeMillis());
                   e.apply();
+              }
+
+              private String findLikelyDurationText(AccessibilityNodeInfo root) {
+                  ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>(); q.add(root);
+                  java.util.regex.Pattern p = java.util.regex.Pattern.compile(".*(?:\\d{1,2}):[0-5]\\d:[0-5]\\d.*");
+                  String best = null;
+                  while (!q.isEmpty()) {
+                      AccessibilityNodeInfo n=q.remove(); String t=nodeText(n);
+                      if (!empty(t) && t.length()<80 && p.matcher(t).matches()) {
+                          if (best==null || t.length()<best.length()) best=t;
+                      }
+                      for(int i=0;i<n.getChildCount();i++){ AccessibilityNodeInfo c=n.getChild(i); if(c!=null)q.add(c); }
+                  }
+                  return best;
               }
 
               private String findLikelyClockText(AccessibilityNodeInfo root) {
@@ -780,11 +1109,11 @@ jobs:
         shell: bash
         run: |
           ./gradle-8.7/bin/gradle :app:assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v7.apk
+          cp app/build/outputs/apk/debug/app-debug.apk SubtitleAutoFind-v9.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: SubtitleAutoFind-v7-apk
-          path: SubtitleAutoFind-v7.apk
+          name: SubtitleAutoFind-v9-apk
+          path: SubtitleAutoFind-v9.apk
           if-no-files-found: error
